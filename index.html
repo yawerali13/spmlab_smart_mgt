@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Smart Healthcare PMS</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🏥</text></svg>">
+<style>
+BUILD_CSS_HERE
+</style>
+</head>
+<body>
+<div id="loading">Loading Smart Healthcare Project Management System…</div>
+<div id="errorBanner"></div>
+
+<div id="app" style="display:none">
+  <header>
+    <div class="topbar">
+      <div>
+        <h1>🏥 Smart Healthcare Project Management &amp; Monitoring System</h1>
+        <div class="sub">Case Study: 5-hospital network — appointments, lab reports, doctor schedules, consultations, billing</div>
+      </div>
+      <div class="topbar-controls">
+        <label>As-of date (simulated "today" for schedule &amp; EVM calculations)
+          <input type="date" id="asOfDate" onchange="onAsOfChange()">
+        </label>
+        <button class="btn secondary" onclick="resetSample()">Reset Sample Data</button>
+      </div>
+    </div>
+  </header>
+
+  <nav class="tabs">
+    <button class="tabbtn active" id="btn-dashboard" onclick="switchTab('dashboard')">Dashboard</button>
+    <button class="tabbtn" id="btn-charter" onclick="switchTab('charter')">1. Initiation &amp; Integration</button>
+    <button class="tabbtn" id="btn-scope" onclick="switchTab('scope')">2. Scope &amp; WBS</button>
+    <button class="tabbtn" id="btn-schedule" onclick="switchTab('schedule')">3. Schedule &amp; Resources</button>
+    <button class="tabbtn" id="btn-cost" onclick="switchTab('cost')">4. Cost &amp; EVM</button>
+    <button class="tabbtn" id="btn-quality" onclick="switchTab('quality')">5. Quality &amp; Risk</button>
+  </nav>
+
+  <main>
+    <div class="tabpanel" id="tab-dashboard" style="display:block"></div>
+    <div class="tabpanel" id="tab-charter"></div>
+    <div class="tabpanel" id="tab-scope"></div>
+    <div class="tabpanel" id="tab-schedule"></div>
+    <div class="tabpanel" id="tab-cost"></div>
+    <div class="tabpanel" id="tab-quality"></div>
+  </main>
+
+  <footer>Data is stored persistently in a real SQLite database (via sql.js) in your browser's local storage. Use "Reset Sample Data" to restore the original case-study dataset.</footer>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.3/sql-wasm.js"></script>
+<script>
+BUILD_JS_HERE
+</script>
+<script>
+initApp();
+</script>
+</body>
+</html>

@@ -1,0 +1,1265 @@
+/* ============================================================
+   Smart Healthcare Project Management & Monitoring System
+   Single-file working application backed by a real SQLite
+   database running in the browser via sql.js (WebAssembly).
+   ============================================================ */
+
+let SQL = null;
+let db = null;
+const PROJECT_ID = 1;
+const LS_KEY = 'healthcare_pms_db_v1';
+const LS_ASOF = 'healthcare_pms_asof_v1';
+
+/* ---------------------------------------------------------
+   SCHEMA
+--------------------------------------------------------- */
+const SCHEMA_SQL = `
+CREATE TABLE project (
+  id INTEGER PRIMARY KEY,
+  name TEXT NOT NULL,
+  objectives TEXT,
+  stakeholders TEXT,
+  scope_boundaries TEXT,
+  approved_budget REAL NOT NULL,
+  deadline_weeks INTEGER NOT NULL,
+  start_date TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'Active',
+  plan_scope TEXT,
+  plan_schedule TEXT,
+  plan_cost TEXT,
+  plan_quality TEXT,
+  closure_notes TEXT
+);
+
+CREATE TABLE milestones (
+  id INTEGER PRIMARY KEY,
+  project_id INTEGER NOT NULL,
+  name TEXT NOT NULL,
+  due_date TEXT NOT NULL,
+  responsible TEXT,
+  status TEXT NOT NULL DEFAULT 'Pending'
+);
+
+CREATE TABLE team_members (
+  id INTEGER PRIMARY KEY,
+  name TEXT NOT NULL,
+  role TEXT NOT NULL
+);
+
+CREATE TABLE requirements (
+  id INTEGER PRIMARY KEY,
+  project_id INTEGER NOT NULL,
+  description TEXT NOT NULL,
+  priority TEXT NOT NULL DEFAULT 'Medium',
+  status TEXT NOT NULL DEFAULT 'Proposed',
+  date_added TEXT NOT NULL
+);
+
+CREATE TABLE wbs (
+  id INTEGER PRIMARY KEY,
+  project_id INTEGER NOT NULL,
+  parent_id INTEGER,
+  code TEXT,
+  name TEXT NOT NULL,
+  type TEXT NOT NULL DEFAULT 'Work Package',
+  requirement_id INTEGER
+);
+
+CREATE TABLE change_requests (
+  id INTEGER PRIMARY KEY,
+  project_id INTEGER NOT NULL,
+  description TEXT NOT NULL,
+  justification TEXT,
+  cost_impact REAL NOT NULL DEFAULT 0,
+  schedule_impact_days INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'Pending',
+  date_raised TEXT NOT NULL
+);
+
+CREATE TABLE activities (
+  id INTEGER PRIMARY KEY,
+  project_id INTEGER NOT NULL,
+  wbs_id INTEGER,
+  name TEXT NOT NULL,
+  assigned_to INTEGER,
+  planned_start TEXT NOT NULL,
+  planned_end TEXT NOT NULL,
+  actual_start TEXT,
+  actual_end TEXT,
+  cost_estimate REAL NOT NULL DEFAULT 0,
+  actual_cost REAL NOT NULL DEFAULT 0,
+  percent_complete REAL NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'Not Started'
+);
+
+CREATE TABLE dependencies (
+  id INTEGER PRIMARY KEY,
+  activity_id INTEGER NOT NULL,
+  depends_on_id INTEGER NOT NULL
+);
+
+CREATE TABLE defects (
+  id INTEGER PRIMARY KEY,
+  project_id INTEGER NOT NULL,
+  activity_id INTEGER,
+  description TEXT NOT NULL,
+  severity TEXT NOT NULL DEFAULT 'Medium',
+  assigned_to INTEGER,
+  status TEXT NOT NULL DEFAULT 'Open',
+  date_reported TEXT NOT NULL
+);
+
+CREATE TABLE quality_checklist (
+  id INTEGER PRIMARY KEY,
+  project_id INTEGER NOT NULL,
+  wbs_id INTEGER,
+  criterion TEXT NOT NULL,
+  result TEXT NOT NULL DEFAULT 'Pending',
+  tested_by TEXT,
+  date_tested TEXT
+);
+
+CREATE TABLE risks (
+  id INTEGER PRIMARY KEY,
+  project_id INTEGER NOT NULL,
+  description TEXT NOT NULL,
+  likelihood INTEGER NOT NULL DEFAULT 3,
+  impact INTEGER NOT NULL DEFAULT 3,
+  response_strategy TEXT,
+  pdpc_preventive TEXT,
+  pdpc_corrective TEXT,
+  status TEXT NOT NULL DEFAULT 'Open'
+);
+`;
+
+/* ---------------------------------------------------------
+   DB HELPERS
+--------------------------------------------------------- */
+function run(sql, params = []) {
+  try {
+    db.run(sql, params);
+    persist();
+  } catch (e) {
+    showError(e.message);
+    throw e;
+  }
+}
+
+function query(sql, params = []) {
+  try {
+    const res = db.exec(sql, params);
+    if (!res.length) return [];
+    const { columns, values } = res[0];
+    return values.map(row => {
+      const obj = {};
+      columns.forEach((c, i) => (obj[c] = row[i]));
+      return obj;
+    });
+  } catch (e) {
+    showError(e.message);
+    return [];
+  }
+}
+
+function one(sql, params = []) {
+  const r = query(sql, params);
+  return r.length ? r[0] : null;
+}
+
+function persist() {
+  try {
+    const data = db.export();
+    let binary = '';
+    for (let i = 0; i < data.length; i++) binary += String.fromCharCode(data[i]);
+    localStorage.setItem(LS_KEY, btoa(binary));
+  } catch (e) {
+    console.error('persist failed', e);
+  }
+}
+
+function showError(msg) {
+  const el = document.getElementById('errorBanner');
+  if (!el) { alert(msg); return; }
+  el.textContent = 'Error: ' + msg;
+  el.style.display = 'block';
+  clearTimeout(window.__errTimer);
+  window.__errTimer = setTimeout(() => (el.style.display = 'none'), 6000);
+}
+
+function esc(s) {
+  if (s === null || s === undefined) return '';
+  return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+function fmtMoney(n) {
+  n = Number(n) || 0;
+  return 'PKR ' + n.toLocaleString(undefined, { maximumFractionDigits: 0 });
+}
+
+function daysBetween(a, b) {
+  return Math.round((new Date(b) - new Date(a)) / 86400000);
+}
+
+function addDays(dateStr, days) {
+  const d = new Date(dateStr);
+  d.setDate(d.getDate() + days);
+  return d.toISOString().slice(0, 10);
+}
+
+function getAsOf() {
+  return document.getElementById('asOfDate').value || new Date().toISOString().slice(0, 10);
+}
+
+/* ---------------------------------------------------------
+   SEED DATA (realistic sample data based on the case study)
+--------------------------------------------------------- */
+function seedData() {
+  const start = '2026-01-05';
+  run(`INSERT INTO project (id, name, objectives, stakeholders, scope_boundaries, approved_budget, deadline_weeks, start_date, status, plan_scope, plan_schedule, plan_cost, plan_quality)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`, [
+    PROJECT_ID,
+    'Smart Healthcare Project Management and Monitoring System',
+    'Deliver an integrated system for a network of 5 hospitals to manage appointments, lab reports, doctor schedules, online consultations and billing.',
+    'Hospital Network Management (Sponsor), Project Manager, Backend/Frontend/DB developers, QA Engineer, Patients, Doctors, Billing Staff',
+    'In scope: appointment scheduling, lab reports, doctor schedules, online consultations, billing. Out of scope (unless CR approved): AI diagnosis module, mobile app.',
+    5000000, 16, start, 'Active',
+    'Scope baselined from 5 approved requirement areas, decomposed into a 3-level WBS. Unapproved requirements are excluded from the baseline.',
+    '16-week schedule across 5 work streams with finish-to-start dependencies between design, build and test activities.',
+    'PKR 5,000,000 approved budget, tracked via Earned Value Management (PV/EV/AC, CPI, SPI).',
+    'Defect tracking, deliverable inspection checklist, and a likelihood/impact risk prioritization matrix with PDPC-style response planning.'
+  ]);
+
+  // Team members
+  const team = [
+    ['Imran Qureshi', 'Project Manager'],
+    ['Hassan Raza', 'Backend Developer'],
+    ['Bilal Ahmed', 'Backend Developer'],
+    ['Sara Khan', 'Frontend Developer'],
+    ['Ayesha Noor', 'Frontend Developer'],
+    ['Usman Tariq', 'Database Developer'],
+    ['Mehwish Iqbal', 'QA Engineer']
+  ];
+  team.forEach(([name, role]) => run(`INSERT INTO team_members (name, role) VALUES (?,?)`, [name, role]));
+
+  // Requirements (some approved, one still proposed to demonstrate the approval gate)
+  const reqs = [
+    ['Patients can book, reschedule and cancel appointments online', 'High', 'Approved'],
+    ['Lab reports can be uploaded and viewed by doctors and patients', 'High', 'Approved'],
+    ['Doctor duty schedules are maintained per hospital', 'Medium', 'Approved'],
+    ['Patients can hold video/online consultations with doctors', 'High', 'Approved'],
+    ['Hospital billing and invoicing across the 5-hospital network', 'High', 'Approved'],
+    ['AI-based preliminary diagnosis suggestions for patients', 'Medium', 'Proposed'],
+    ['Native mobile application for patients', 'Medium', 'Proposed']
+  ];
+  reqs.forEach(([d, p, s]) => run(`INSERT INTO requirements (project_id, description, priority, status, date_added) VALUES (?,?,?,?,?)`,
+    [PROJECT_ID, d, p, s, start]));
+
+  // WBS (3 levels): 1 Project -> Deliverables -> Work Packages, each linked to an APPROVED requirement
+  const wbsId = (code, name, type, parentId, reqId) => {
+    run(`INSERT INTO wbs (project_id, parent_id, code, name, type, requirement_id) VALUES (?,?,?,?,?,?)`,
+      [PROJECT_ID, parentId, code, name, type, reqId]);
+    return one(`SELECT last_insert_rowid() AS id`).id;
+  };
+  const root = wbsId('1.0', 'Smart Healthcare PMS', 'Project', null, null);
+
+  const d1 = wbsId('1.1', 'Appointment Scheduling Module', 'Deliverable', root, 1);
+  wbsId('1.1.1', 'Design appointment booking workflow', 'Work Package', d1, 1);
+  wbsId('1.1.2', 'Build booking & reschedule/cancel APIs', 'Work Package', d1, 1);
+  wbsId('1.1.3', 'Test appointment scheduling module', 'Work Package', d1, 1);
+
+  const d2 = wbsId('1.2', 'Laboratory Reports Module', 'Deliverable', root, 2);
+  wbsId('1.2.1', 'Design lab report data model', 'Work Package', d2, 2);
+  wbsId('1.2.2', 'Build lab report upload & viewing', 'Work Package', d2, 2);
+
+  const d3 = wbsId('1.3', 'Doctor Schedules Module', 'Deliverable', root, 3);
+  wbsId('1.3.1', 'Build doctor duty roster management', 'Work Package', d3, 3);
+
+  const d4 = wbsId('1.4', 'Online Consultation Module', 'Deliverable', root, 4);
+  wbsId('1.4.1', 'Integrate video consultation service', 'Work Package', d4, 4);
+  wbsId('1.4.2', 'Build consultation notes & prescriptions', 'Work Package', d4, 4);
+
+  const d5 = wbsId('1.5', 'Hospital Billing Module', 'Deliverable', root, 5);
+  wbsId('1.5.1', 'Design multi-hospital billing rules', 'Work Package', d5, 5);
+  wbsId('1.5.2', 'Build invoicing & payment tracking', 'Work Package', d5, 5);
+
+  // Change Request: AI diagnosis module + mobile app (matches case study, +800,000 PKR, +3 weeks)
+  run(`INSERT INTO change_requests (project_id, description, justification, cost_impact, schedule_impact_days, status, date_raised)
+       VALUES (?,?,?,?,?,?,?)`, [
+    PROJECT_ID,
+    'Add AI-based preliminary diagnosis module and a native mobile application',
+    'Hospital management requested additional capability to triage patients earlier and reach patients on mobile devices.',
+    800000, 21, 'Approved', '2026-02-16'
+  ]);
+  run(`INSERT INTO change_requests (project_id, description, justification, cost_impact, schedule_impact_days, status, date_raised)
+       VALUES (?,?,?,?,?,?,?)`, [
+    PROJECT_ID,
+    'Add SMS appointment reminders',
+    'Reduce patient no-show rate across hospitals.',
+    60000, 4, 'Pending', '2026-03-02'
+  ]);
+
+  // Team ids
+  const T = query(`SELECT id, name FROM team_members`);
+  const tid = n => T.find(t => t.name === n).id;
+
+  // Activities per work package (realistic plan vs actual, as of ~ week 14-15 to show overruns)
+  const W = query(`SELECT id, code FROM wbs WHERE type='Work Package'`);
+  const wid = code => W.find(w => w.code === code).id;
+
+  const activities = [
+    // [wbs, name, assignee, p_start, p_end, a_start, a_end, cost_est, actual_cost, pct, status]
+    ['1.1.1', 'Design appointment booking workflow', tid('Sara Khan'), '2026-01-05', '2026-01-16', '2026-01-05', '2026-01-18', 120000, 125000, 100, 'Completed'],
+    ['1.1.2', 'Build booking & reschedule/cancel APIs', tid('Hassan Raza'), '2026-01-19', '2026-02-13', '2026-01-19', null, 350000, 300000, 70, 'In Progress'],
+    ['1.1.3', 'Test appointment scheduling module', tid('Mehwish Iqbal'), '2026-02-16', '2026-02-27', null, null, 150000, 0, 0, 'Not Started'],
+    ['1.2.1', 'Design lab report data model', tid('Usman Tariq'), '2026-01-05', '2026-01-13', '2026-01-05', '2026-01-13', 90000, 88000, 100, 'Completed'],
+    ['1.2.2', 'Build lab report upload & viewing', tid('Bilal Ahmed'), '2026-01-14', '2026-02-06', '2026-01-14', '2026-02-10', 300000, 330000, 100, 'Completed'],
+    ['1.3.1', 'Build doctor duty roster management', tid('Ayesha Noor'), '2026-01-05', '2026-01-30', '2026-01-08', null, 220000, 180000, 85, 'In Progress'],
+    ['1.4.1', 'Integrate video consultation service', tid('Hassan Raza'), '2026-02-16', '2026-03-13', null, null, 400000, 40000, 10, 'In Progress'],
+    ['1.4.2', 'Build consultation notes & prescriptions', tid('Bilal Ahmed'), '2026-03-16', '2026-03-27', null, null, 180000, 0, 0, 'Not Started'],
+    ['1.5.1', 'Design multi-hospital billing rules', tid('Usman Tariq'), '2026-01-19', '2026-02-06', '2026-01-19', '2026-02-02', 160000, 150000, 100, 'Completed'],
+    ['1.5.2', 'Build invoicing & payment tracking', tid('Sara Khan'), '2026-02-09', '2026-03-06', '2026-02-09', null, 350000, 220000, 55, 'In Progress']
+  ];
+  const actId = {};
+  activities.forEach(a => {
+    run(`INSERT INTO activities (project_id, wbs_id, name, assigned_to, planned_start, planned_end, actual_start, actual_end, cost_estimate, actual_cost, percent_complete, status)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [PROJECT_ID, wid(a[0]), a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10]]);
+    actId[a[0]] = one(`SELECT last_insert_rowid() AS id`).id;
+  });
+
+  // Dependencies (finish-to-start)
+  const dep = (code, dependsOnCode) => run(`INSERT INTO dependencies (activity_id, depends_on_id) VALUES (?,?)`, [actId[code], actId[dependsOnCode]]);
+  dep('1.1.2', '1.1.1');
+  dep('1.1.3', '1.1.2');
+  dep('1.2.2', '1.2.1');
+
+  // Defects (critical defects in appointment scheduling & patient record mgmt, per case study)
+  run(`INSERT INTO defects (project_id, activity_id, description, severity, assigned_to, status, date_reported) VALUES (?,?,?,?,?,?,?)`,
+    [PROJECT_ID, actId['1.1.2'], 'Double-booking occurs when two patients book the same slot concurrently', 'Critical', tid('Hassan Raza'), 'Open', '2026-02-05']);
+  run(`INSERT INTO defects (project_id, activity_id, description, severity, assigned_to, status, date_reported) VALUES (?,?,?,?,?,?,?)`,
+    [PROJECT_ID, actId['1.2.2'], 'Patient record updates are occasionally overwritten by concurrent edits', 'Critical', tid('Bilal Ahmed'), 'In Progress', '2026-02-18']);
+  run(`INSERT INTO defects (project_id, activity_id, description, severity, assigned_to, status, date_reported) VALUES (?,?,?,?,?,?,?)`,
+    [PROJECT_ID, actId['1.1.1'], 'Appointment confirmation email uses wrong hospital branch name', 'Low', tid('Sara Khan'), 'Resolved', '2026-01-20']);
+  run(`INSERT INTO defects (project_id, activity_id, description, severity, assigned_to, status, date_reported) VALUES (?,?,?,?,?,?,?)`,
+    [PROJECT_ID, actId['1.5.1'], 'Billing rule mismatch for inter-hospital referral cases', 'High', tid('Usman Tariq'), 'Open', '2026-02-10']);
+
+  // Quality checklist
+  const qc = (code, criterion, result, tester, date) => run(
+    `INSERT INTO quality_checklist (project_id, wbs_id, criterion, result, tested_by, date_tested) VALUES (?,?,?,?,?,?)`,
+    [PROJECT_ID, wid(code), criterion, result, tester, date]);
+  qc('1.1.1', 'Booking workflow matches approved requirement', 'Pass', 'Mehwish Iqbal', '2026-01-17');
+  qc('1.2.2', 'Lab report upload supports PDF/JPEG up to 10MB', 'Pass', 'Mehwish Iqbal', '2026-02-09');
+  qc('1.2.2', 'Lab report access restricted to assigned doctor and patient', 'Fail', 'Mehwish Iqbal', '2026-02-09');
+  qc('1.5.1', 'Billing totals reconcile across all 5 hospitals', 'Pending', 'Mehwish Iqbal', null);
+
+  // Risks (prioritization matrix inputs + PDPC)
+  const risks = [
+    ['Integration delay between hospitals\' legacy systems and the new platform', 4, 5,
+      'Mitigate', 'Run early integration spike with each hospital IT team in week 2', 'Fall back to manual data import utility if API integration slips', 'Open'],
+    ['AI diagnosis module accuracy insufficient for clinical use', 3, 5,
+      'Mitigate', 'Validate model with clinical dataset before rollout; keep human-in-the-loop', 'Disable AI suggestions and revert to manual triage only', 'Open'],
+    ['Key backend developer unavailable during critical build phase', 2, 4,
+      'Mitigate', 'Cross-train a second developer and maintain shared documentation', 'Reassign QA engineer temporarily and extend timeline', 'Open'],
+    ['Scope creep from additional hospital-specific billing rules', 4, 3,
+      'Mitigate', 'Freeze billing scope after CR approval; route further changes through change control', 'Negotiate schedule/cost adjustment via new change request', 'Open'],
+    ['Patient data privacy/security breach during online consultations', 2, 5,
+      'Avoid', 'Enforce end-to-end encryption and access control audits before go-live', 'Activate incident response plan and notify hospitals/regulator', 'Open']
+  ];
+  risks.forEach(r => run(
+    `INSERT INTO risks (project_id, description, likelihood, impact, response_strategy, pdpc_preventive, pdpc_corrective, status) VALUES (?,?,?,?,?,?,?,?)`,
+    [PROJECT_ID, ...r]));
+
+  // Milestones
+  const ms = (name, due, resp, status) => run(`INSERT INTO milestones (project_id, name, due_date, responsible, status) VALUES (?,?,?,?,?)`, [PROJECT_ID, name, due, resp, status]);
+  ms('Requirements baseline approved', '2026-01-09', 'Imran Qureshi', 'Completed');
+  ms('Appointment & Lab modules complete', '2026-02-13', 'Imran Qureshi', 'Delayed');
+  ms('Change request (AI + mobile) integrated into plan', '2026-02-16', 'Imran Qureshi', 'Completed');
+  ms('Consultation & Billing modules complete', '2026-03-27', 'Imran Qureshi', 'Pending');
+  ms('UAT & project closure', '2026-05-15', 'Imran Qureshi', 'Pending');
+
+  localStorage.setItem(LS_ASOF, '2026-02-20');
+}
+
+/* ---------------------------------------------------------
+   INIT
+--------------------------------------------------------- */
+async function initApp() {
+  SQL = await initSqlJs({ locateFile: f => `https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.3/${f}` });
+  const saved = localStorage.getItem(LS_KEY);
+  if (saved) {
+    try {
+      const binary = atob(saved);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      db = new SQL.Database(bytes);
+      // sanity check
+      query(`SELECT id FROM project LIMIT 1`);
+    } catch (e) {
+      db = null;
+    }
+  }
+  if (!db) {
+    db = new SQL.Database();
+    db.run(SCHEMA_SQL);
+    seedData();
+    persist();
+  }
+  document.getElementById('asOfDate').value = localStorage.getItem(LS_ASOF) || new Date().toISOString().slice(0, 10);
+  document.getElementById('loading').style.display = 'none';
+  document.getElementById('app').style.display = 'block';
+  renderAll();
+}
+
+function onAsOfChange() {
+  localStorage.setItem(LS_ASOF, getAsOf());
+  renderAll();
+}
+
+function resetSample() {
+  if (!confirm('This will erase all current data and reload the original case-study sample data. Continue?')) return;
+  localStorage.removeItem(LS_KEY);
+  db.close();
+  db = new SQL.Database();
+  db.run(SCHEMA_SQL);
+  seedData();
+  persist();
+  document.getElementById('asOfDate').value = localStorage.getItem(LS_ASOF);
+  renderAll();
+}
+
+function switchTab(tab) {
+  document.querySelectorAll('.tabpanel').forEach(p => (p.style.display = 'none'));
+  document.querySelectorAll('.tabbtn').forEach(b => b.classList.remove('active'));
+  document.getElementById('tab-' + tab).style.display = 'block';
+  document.getElementById('btn-' + tab).classList.add('active');
+  renderAll();
+}
+
+function renderAll() {
+  renderDashboard();
+  renderCharter();
+  renderScope();
+  renderSchedule();
+  renderCost();
+  renderQuality();
+}
+
+/* ===========================================================
+   MODULE 1: PROJECT INITIATION & INTEGRATION MANAGEMENT
+=========================================================== */
+function renderCharter() {
+  const p = one(`SELECT * FROM project WHERE id=?`, [PROJECT_ID]);
+  if (!p) return;
+  const approvedCR = query(`SELECT COALESCE(SUM(cost_impact),0) c, COALESCE(SUM(schedule_impact_days),0) s FROM change_requests WHERE project_id=? AND status='Approved'`, [PROJECT_ID])[0];
+  const currentBudget = p.approved_budget + approvedCR.c;
+  const currentDeadlineDate = addDays(p.start_date, p.deadline_weeks * 7 + approvedCR.s);
+
+  document.getElementById('tab-charter').innerHTML = `
+    <h2>Project Charter</h2>
+    <div class="grid2">
+      <div class="card">
+        <h3>Charter Details</h3>
+        <form onsubmit="return saveCharter(event)">
+          <label>Project Name</label>
+          <input name="name" value="${esc(p.name)}" required>
+          <label>Objectives</label>
+          <textarea name="objectives" rows="2">${esc(p.objectives)}</textarea>
+          <label>Stakeholders</label>
+          <textarea name="stakeholders" rows="2">${esc(p.stakeholders)}</textarea>
+          <label>Scope Boundaries</label>
+          <textarea name="scope_boundaries" rows="2">${esc(p.scope_boundaries)}</textarea>
+          <div class="grid2">
+            <div><label>Approved Budget (PKR)</label><input type="number" name="approved_budget" value="${p.approved_budget}" required></div>
+            <div><label>Deadline (weeks)</label><input type="number" name="deadline_weeks" value="${p.deadline_weeks}" required></div>
+          </div>
+          <div class="grid2">
+            <div><label>Start Date</label><input type="date" name="start_date" value="${p.start_date}" required></div>
+            <div><label>Status</label>
+              <select name="status">
+                ${['Active','On Hold','Closed'].map(s => `<option ${s===p.status?'selected':''}>${s}</option>`).join('')}
+              </select>
+            </div>
+          </div>
+          <button class="btn" type="submit">Save Charter</button>
+        </form>
+      </div>
+      <div class="card">
+        <h3>Baseline Status (computed)</h3>
+        <table class="kv">
+          <tr><td>Original Approved Budget</td><td>${fmtMoney(p.approved_budget)}</td></tr>
+          <tr><td>Approved Change Requests (cost)</td><td>${fmtMoney(approvedCR.c)}</td></tr>
+          <tr><td><b>Current Approved Budget</b></td><td><b>${fmtMoney(currentBudget)}</b></td></tr>
+          <tr><td>Original Deadline</td><td>${addDays(p.start_date, p.deadline_weeks*7)} (${p.deadline_weeks} weeks)</td></tr>
+          <tr><td>Approved Schedule Slip (CRs)</td><td>${approvedCR.s} days</td></tr>
+          <tr><td><b>Current Deadline</b></td><td><b>${currentDeadlineDate}</b></td></tr>
+        </table>
+        <h3>Project Management Plan</h3>
+        <form onsubmit="return savePlan(event)">
+          <label>Scope Management Plan</label>
+          <textarea name="plan_scope" rows="2">${esc(p.plan_scope)}</textarea>
+          <label>Schedule Management Plan</label>
+          <textarea name="plan_schedule" rows="2">${esc(p.plan_schedule)}</textarea>
+          <label>Cost Management Plan</label>
+          <textarea name="plan_cost" rows="2">${esc(p.plan_cost)}</textarea>
+          <label>Quality Management Plan</label>
+          <textarea name="plan_quality" rows="2">${esc(p.plan_quality)}</textarea>
+          <button class="btn" type="submit">Save Plan</button>
+        </form>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>Milestones</h3>
+      <form onsubmit="return addMilestone(event)" class="inline-form">
+        <input name="name" placeholder="Milestone name" required>
+        <input name="due_date" type="date" required>
+        <input name="responsible" placeholder="Responsible">
+        <select name="status">${['Pending','Completed','Delayed'].map(s=>`<option>${s}</option>`).join('')}</select>
+        <button class="btn" type="submit">Add Milestone</button>
+      </form>
+      <table class="data">
+        <thead><tr><th>Name</th><th>Due Date</th><th>Responsible</th><th>Status</th><th></th></tr></thead>
+        <tbody>
+          ${query(`SELECT * FROM milestones WHERE project_id=? ORDER BY due_date`, [PROJECT_ID]).map(m => `
+            <tr>
+              <td>${esc(m.name)}</td><td>${m.due_date}</td><td>${esc(m.responsible||'')}</td>
+              <td><span class="badge ${badgeClass(m.status)}">${m.status}</span></td>
+              <td><button class="btn-sm danger" onclick="deleteRow('milestones', ${m.id})">Delete</button></td>
+            </tr>`).join('')}
+        </tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h3>Project Closure</h3>
+      <form onsubmit="return saveClosure(event)">
+        <textarea name="closure_notes" rows="3" placeholder="Closure notes: deliverables accepted, lessons learned, sign-off...">${esc(p.closure_notes || '')}</textarea>
+        <button class="btn" type="submit">Save Closure Notes</button>
+        <button type="button" class="btn secondary" onclick="closeProject()">Mark Project Closed</button>
+      </form>
+    </div>
+  `;
+}
+
+function badgeClass(status) {
+  const map = { Completed:'green', Approved:'green', Pass:'green', Resolved:'green', Closed:'green',
+    Delayed:'red', Rejected:'red', Fail:'red', Critical:'red', Open:'orange', Pending:'orange',
+    'In Progress':'blue', 'Not Started':'grey', Proposed:'grey', High:'orange' };
+  return map[status] || 'grey';
+}
+
+function saveCharter(ev) {
+  ev.preventDefault();
+  const f = new FormData(ev.target);
+  run(`UPDATE project SET name=?, objectives=?, stakeholders=?, scope_boundaries=?, approved_budget=?, deadline_weeks=?, start_date=?, status=? WHERE id=?`,
+    [f.get('name'), f.get('objectives'), f.get('stakeholders'), f.get('scope_boundaries'),
+     parseFloat(f.get('approved_budget')), parseInt(f.get('deadline_weeks')), f.get('start_date'), f.get('status'), PROJECT_ID]);
+  renderAll();
+  return false;
+}
+
+function savePlan(ev) {
+  ev.preventDefault();
+  const f = new FormData(ev.target);
+  run(`UPDATE project SET plan_scope=?, plan_schedule=?, plan_cost=?, plan_quality=? WHERE id=?`,
+    [f.get('plan_scope'), f.get('plan_schedule'), f.get('plan_cost'), f.get('plan_quality'), PROJECT_ID]);
+  renderAll();
+  return false;
+}
+
+function saveClosure(ev) {
+  ev.preventDefault();
+  const f = new FormData(ev.target);
+  run(`UPDATE project SET closure_notes=? WHERE id=?`, [f.get('closure_notes'), PROJECT_ID]);
+  renderAll();
+  return false;
+}
+
+function closeProject() {
+  if (!confirm('Mark the project as Closed?')) return;
+  run(`UPDATE project SET status='Closed' WHERE id=?`, [PROJECT_ID]);
+  renderAll();
+}
+
+function addMilestone(ev) {
+  ev.preventDefault();
+  const f = new FormData(ev.target);
+  if (!f.get('name').trim()) { showError('Milestone name is required'); return false; }
+  run(`INSERT INTO milestones (project_id, name, due_date, responsible, status) VALUES (?,?,?,?,?)`,
+    [PROJECT_ID, f.get('name'), f.get('due_date'), f.get('responsible'), f.get('status')]);
+  ev.target.reset();
+  renderAll();
+  return false;
+}
+
+function deleteRow(table, id) {
+  if (!confirm('Delete this record?')) return;
+  run(`DELETE FROM ${table} WHERE id=?`, [id]);
+  renderAll();
+}
+
+/* ===========================================================
+   MODULE 2: SCOPE MANAGEMENT & WBS
+=========================================================== */
+function renderScope() {
+  const reqs = query(`SELECT * FROM requirements WHERE project_id=? ORDER BY id`, [PROJECT_ID]);
+  const wbsAll = query(`SELECT * FROM wbs WHERE project_id=? ORDER BY code`, [PROJECT_ID]);
+  const crs = query(`SELECT * FROM change_requests WHERE project_id=? ORDER BY id`, [PROJECT_ID]);
+  const approvedReqs = reqs.filter(r => r.status === 'Approved');
+
+  document.getElementById('tab-scope').innerHTML = `
+    <h2>Scope Management</h2>
+
+    <div class="card">
+      <h3>Requirements</h3>
+      <form onsubmit="return addRequirement(event)" class="inline-form">
+        <input name="description" placeholder="Requirement description" style="flex:2" required>
+        <select name="priority">${['Low','Medium','High'].map(p=>`<option>${p}</option>`).join('')}</select>
+        <button class="btn" type="submit">Add Requirement</button>
+      </form>
+      <table class="data">
+        <thead><tr><th>#</th><th>Description</th><th>Priority</th><th>Status</th><th>Added</th><th>Actions</th></tr></thead>
+        <tbody>
+          ${reqs.map(r => `
+            <tr>
+              <td>REQ-${r.id}</td><td>${esc(r.description)}</td><td>${r.priority}</td>
+              <td><span class="badge ${badgeClass(r.status)}">${r.status}</span></td>
+              <td>${r.date_added}</td>
+              <td>
+                ${r.status !== 'Approved' ? `<button class="btn-sm" onclick="setReqStatus(${r.id},'Approved')">Approve</button>` : ''}
+                ${r.status !== 'Rejected' ? `<button class="btn-sm danger" onclick="setReqStatus(${r.id},'Rejected')">Reject</button>` : ''}
+                <button class="btn-sm danger" onclick="deleteRow('requirements', ${r.id})">Delete</button>
+              </td>
+            </tr>`).join('')}
+        </tbody>
+      </table>
+      <p class="hint">Only <b>Approved</b> requirements can be linked into the Work Breakdown Structure below — this enforces that unapproved requirements cannot enter the approved project scope.</p>
+    </div>
+
+    <div class="card">
+      <h3>Work Breakdown Structure (WBS)</h3>
+      <form onsubmit="return addWbs(event)" class="inline-form">
+        <input name="code" placeholder="Code e.g. 1.6" style="width:90px" required>
+        <input name="name" placeholder="Deliverable / work package name" style="flex:2" required>
+        <select name="type">${['Deliverable','Work Package'].map(t=>`<option>${t}</option>`).join('')}</select>
+        <select name="parent_id">
+          <option value="">(top level under project)</option>
+          ${wbsAll.map(w => `<option value="${w.id}">${esc(w.code)} ${esc(w.name)}</option>`).join('')}
+        </select>
+        <select name="requirement_id">
+          <option value="">(no linked requirement)</option>
+          ${approvedReqs.map(r => `<option value="${r.id}">REQ-${r.id}: ${esc(r.description).slice(0,40)}</option>`).join('')}
+        </select>
+        <button class="btn" type="submit">Add WBS Node</button>
+      </form>
+      ${renderWbsTree(wbsAll)}
+    </div>
+
+    <div class="card">
+      <h3>Change Requests</h3>
+      <form onsubmit="return addCR(event)" class="inline-form">
+        <input name="description" placeholder="Change description" style="flex:2" required>
+        <input name="justification" placeholder="Justification" style="flex:2">
+        <input name="cost_impact" type="number" step="1000" placeholder="Cost impact (PKR)" required>
+        <input name="schedule_impact_days" type="number" placeholder="Schedule impact (days)" required>
+        <button class="btn" type="submit">Submit CR</button>
+      </form>
+      <table class="data">
+        <thead><tr><th>#</th><th>Description</th><th>Justification</th><th>Cost Impact</th><th>Schedule Impact</th><th>Status</th><th>Raised</th><th>Actions</th></tr></thead>
+        <tbody>
+          ${crs.map(c => `
+            <tr>
+              <td>CR-${c.id}</td><td>${esc(c.description)}</td><td>${esc(c.justification||'')}</td>
+              <td>${fmtMoney(c.cost_impact)}</td><td>${c.schedule_impact_days} days</td>
+              <td><span class="badge ${badgeClass(c.status)}">${c.status}</span></td>
+              <td>${c.date_raised}</td>
+              <td>
+                ${c.status === 'Pending' ? `<button class="btn-sm" onclick="setCRStatus(${c.id},'Approved')">Approve</button>
+                <button class="btn-sm danger" onclick="setCRStatus(${c.id},'Rejected')">Reject</button>` : ''}
+                <button class="btn-sm danger" onclick="deleteRow('change_requests', ${c.id})">Delete</button>
+              </td>
+            </tr>`).join('')}
+        </tbody>
+      </table>
+      <p class="hint">Approving a change request immediately updates the current approved budget and current deadline shown on the Charter and Dashboard tabs (see Integration Management).</p>
+    </div>
+  `;
+}
+
+function renderWbsTree(all) {
+  const byParent = {};
+  all.forEach(w => { (byParent[w.parent_id || 'root'] = byParent[w.parent_id || 'root'] || []).push(w); });
+  function walk(parentKey, depth) {
+    const children = byParent[parentKey] || [];
+    return children.map(w => `
+      <div class="wbs-row" style="padding-left:${depth * 22}px">
+        <span class="wbs-code">${esc(w.code||'')}</span>
+        <span class="wbs-type tag-${w.type.replace(' ','')}">${w.type}</span>
+        <span>${esc(w.name)}</span>
+        ${w.requirement_id ? `<span class="hint">(REQ-${w.requirement_id})</span>` : ''}
+        <button class="btn-sm danger" onclick="deleteRow('wbs', ${w.id})">Delete</button>
+      </div>
+      ${walk(w.id, depth + 1)}
+    `).join('');
+  }
+  return `<div class="wbs-tree">${walk('root', 0) || '<p class="hint">No WBS nodes yet.</p>'}</div>`;
+}
+
+function addRequirement(ev) {
+  ev.preventDefault();
+  const f = new FormData(ev.target);
+  if (!f.get('description').trim()) { showError('Description is required'); return false; }
+  run(`INSERT INTO requirements (project_id, description, priority, status, date_added) VALUES (?,?,?,?,?)`,
+    [PROJECT_ID, f.get('description'), f.get('priority'), 'Proposed', getAsOf()]);
+  ev.target.reset();
+  renderAll();
+  return false;
+}
+function setReqStatus(id, status) { run(`UPDATE requirements SET status=? WHERE id=?`, [status, id]); renderAll(); }
+
+function addWbs(ev) {
+  ev.preventDefault();
+  const f = new FormData(ev.target);
+  const reqId = f.get('requirement_id') || null;
+  if (reqId) {
+    const r = one(`SELECT status FROM requirements WHERE id=?`, [reqId]);
+    if (!r || r.status !== 'Approved') { showError('Only approved requirements can be linked into the WBS.'); return false; }
+  }
+  run(`INSERT INTO wbs (project_id, parent_id, code, name, type, requirement_id) VALUES (?,?,?,?,?,?)`,
+    [PROJECT_ID, f.get('parent_id') || null, f.get('code'), f.get('name'), f.get('type'), reqId]);
+  ev.target.reset();
+  renderAll();
+  return false;
+}
+
+function addCR(ev) {
+  ev.preventDefault();
+  const f = new FormData(ev.target);
+  const cost = parseFloat(f.get('cost_impact'));
+  const sched = parseInt(f.get('schedule_impact_days'));
+  if (isNaN(cost) || isNaN(sched)) { showError('Cost and schedule impact must be numeric'); return false; }
+  run(`INSERT INTO change_requests (project_id, description, justification, cost_impact, schedule_impact_days, status, date_raised) VALUES (?,?,?,?,?,?,?)`,
+    [PROJECT_ID, f.get('description'), f.get('justification'), cost, sched, 'Pending', getAsOf()]);
+  ev.target.reset();
+  renderAll();
+  return false;
+}
+function setCRStatus(id, status) { run(`UPDATE change_requests SET status=? WHERE id=?`, [status, id]); renderAll(); }
+
+/* ===========================================================
+   MODULE 3: SCHEDULE & RESOURCE MANAGEMENT
+=========================================================== */
+function computeScheduleAnalysis() {
+  const asOf = getAsOf();
+  const acts = query(`SELECT * FROM activities WHERE project_id=?`, [PROJECT_ID]);
+  const deps = query(`SELECT * FROM dependencies`);
+  const byId = {}; acts.forEach(a => byId[a.id] = a);
+  const depsOf = {}; deps.forEach(d => (depsOf[d.activity_id] = depsOf[d.activity_id] || []).push(d.depends_on_id));
+
+  const analysis = {};
+  acts.forEach(a => {
+    const effectiveEnd = a.actual_end || a.planned_end;
+    const isLate = (a.status !== 'Completed') && (new Date(effectiveEnd) < new Date(asOf)) ;
+    const finishedLate = a.actual_end && (new Date(a.actual_end) > new Date(a.planned_end));
+    analysis[a.id] = { delayed: isLate || finishedLate, delayDays: 0, impactedBy: [] };
+  });
+
+  // cascade: an activity's recomputed earliest start = max(planned_start, max(dependency effective end)+1)
+  acts.forEach(a => {
+    const dependents = depsOf[a.id] || [];
+    let pushedStart = a.planned_start;
+    dependents.forEach(depId => {
+      const dep = byId[depId];
+      if (!dep) return;
+      const depEnd = dep.actual_end || (analysis[dep.id].delayed ? dep.planned_end : dep.planned_end);
+      const depFinish = dep.status === 'Completed' ? (dep.actual_end || dep.planned_end) : (new Date(asOf) > new Date(dep.planned_end) ? asOf : dep.planned_end);
+      if (new Date(depFinish) >= new Date(pushedStart)) {
+        pushedStart = addDays(depFinish, 1);
+        analysis[a.id].impactedBy.push(dep.id);
+      }
+    });
+    const plannedDuration = daysBetween(a.planned_start, a.planned_end);
+    const newEnd = addDays(pushedStart, plannedDuration);
+    if (new Date(newEnd) > new Date(a.planned_end)) {
+      analysis[a.id].delayed = true;
+      analysis[a.id].delayDays = daysBetween(a.planned_end, newEnd);
+      analysis[a.id].recomputedEnd = newEnd;
+    }
+  });
+
+  const projectEndSlip = Math.max(0, ...acts.map(a => analysis[a.id].delayDays || 0));
+  return { acts, analysis, projectEndSlip, asOf };
+}
+
+function renderSchedule() {
+  const { acts, analysis, projectEndSlip } = computeScheduleAnalysis();
+  const team = query(`SELECT * FROM team_members`);
+  const wbsWP = query(`SELECT * FROM wbs WHERE project_id=? AND type='Work Package' ORDER BY code`, [PROJECT_ID]);
+  const delayed = acts.filter(a => analysis[a.id].delayed);
+
+  document.getElementById('tab-schedule').innerHTML = `
+    <h2>Schedule &amp; Resource Management</h2>
+
+    <div class="card">
+      <h3>Add Activity</h3>
+      <form onsubmit="return addActivity(event)" class="inline-form wrap">
+        <input name="name" placeholder="Activity name" style="flex:2" required>
+        <select name="wbs_id">${wbsWP.map(w => `<option value="${w.id}">${esc(w.code)} ${esc(w.name)}</option>`).join('')}</select>
+        <select name="assigned_to"><option value="">(unassigned)</option>${team.map(t => `<option value="${t.id}">${esc(t.name)}</option>`).join('')}</select>
+        <label>Start<input name="planned_start" type="date" required></label>
+        <label>End<input name="planned_end" type="date" required></label>
+        <input name="cost_estimate" type="number" placeholder="Cost estimate (PKR)" required>
+        <select name="depends_on"><option value="">(no dependency)</option>${acts.map(a => `<option value="${a.id}">${esc(a.name)}</option>`).join('')}</select>
+        <button class="btn" type="submit">Add Activity</button>
+      </form>
+    </div>
+
+    <div class="card">
+      <h3>Activities</h3>
+      <table class="data">
+        <thead><tr><th>Name</th><th>WBS</th><th>Assigned</th><th>Plan Start</th><th>Plan End</th><th>Actual Start</th><th>Actual End</th><th>% Complete</th><th>Status</th><th>Delay</th><th>Actions</th></tr></thead>
+        <tbody>
+          ${acts.map(a => {
+            const w = wbsWP.find(x => x.id === a.wbs_id);
+            const t = team.find(x => x.id === a.assigned_to);
+            const an = analysis[a.id];
+            return `<tr class="${an.delayed ? 'row-warn' : ''}">
+              <td>${esc(a.name)}</td>
+              <td>${w ? esc(w.code) : ''}</td>
+              <td>${t ? esc(t.name) : '<i>unassigned</i>'}</td>
+              <td>${a.planned_start}</td><td>${a.planned_end}</td>
+              <td>${a.actual_start || '-'}</td><td>${a.actual_end || '-'}</td>
+              <td>
+                <input type="number" min="0" max="100" value="${a.percent_complete}" style="width:60px"
+                  onchange="updateActivityField(${a.id}, 'percent_complete', this.value)"> %
+              </td>
+              <td>
+                <select onchange="updateActivityField(${a.id}, 'status', this.value)">
+                  ${['Not Started','In Progress','Completed'].map(s => `<option ${s===a.status?'selected':''}>${s}</option>`).join('')}
+                </select>
+              </td>
+              <td>${an.delayed ? `<span class="badge red">Delayed${an.delayDays ? ' +' + an.delayDays + 'd' : ''}</span>` : `<span class="badge green">On Track</span>`}</td>
+              <td><button class="btn-sm danger" onclick="deleteRow('activities', ${a.id})">Delete</button></td>
+            </tr>`;
+          }).join('')}
+        </tbody>
+      </table>
+      ${projectEndSlip > 0 ? `<p class="warning">⚠ Dependency cascade analysis indicates the final deadline may slip by approximately <b>${projectEndSlip} day(s)</b> if delayed activities are not recovered.</p>` : `<p class="ok">✔ No cascading slip to the final deadline detected as of ${getAsOf()}.</p>`}
+      ${delayed.length ? `<p class="hint">Delayed activities: ${delayed.map(a=>esc(a.name)).join(', ')}</p>` : ''}
+    </div>
+
+    <div class="card">
+      <h3>Milestones &amp; Schedule Timeline (Gantt)</h3>
+      ${renderGantt(acts)}
+    </div>
+  `;
+}
+
+function renderGantt(acts) {
+  if (!acts.length) return '<p class="hint">No activities to display.</p>';
+  const allDates = acts.flatMap(a => [a.planned_start, a.planned_end]);
+  const minDate = allDates.reduce((m, d) => d < m ? d : m);
+  const maxDate = allDates.reduce((m, d) => d > m ? d : m);
+  const totalDays = Math.max(1, daysBetween(minDate, maxDate));
+  const pxPerDay = Math.max(2, Math.min(10, Math.floor(900 / totalDays)));
+  const asOf = getAsOf();
+  const asOfOffset = daysBetween(minDate, asOf) * pxPerDay;
+
+  const rows = acts.map(a => {
+    const offset = daysBetween(minDate, a.planned_start) * pxPerDay;
+    const width = Math.max(4, daysBetween(a.planned_start, a.planned_end) * pxPerDay);
+    const pct = a.percent_complete;
+    const color = a.status === 'Completed' ? '#2e9e5b' : a.status === 'In Progress' ? '#3b7cd3' : '#9aa3af';
+    return `
+      <div class="gantt-row">
+        <div class="gantt-label" title="${esc(a.name)}">${esc(a.name)}</div>
+        <div class="gantt-track" style="width:${totalDays*pxPerDay}px">
+          <div class="gantt-bar" style="left:${offset}px;width:${width}px;background:${color}22;border-color:${color}">
+            <div class="gantt-fill" style="width:${pct}%;background:${color}"></div>
+          </div>
+        </div>
+      </div>`;
+  }).join('');
+
+  return `
+    <div class="gantt-wrap">
+      <div class="gantt-row header">
+        <div class="gantt-label"><b>${minDate}</b></div>
+        <div class="gantt-track" style="width:${totalDays*pxPerDay}px;position:relative">
+          <div class="gantt-today" style="left:${asOfOffset}px" title="As-of date: ${asOf}"></div>
+          <span style="position:absolute;right:0">${maxDate}</span>
+        </div>
+      </div>
+      ${rows}
+    </div>
+    <p class="hint">Grey/blue/green bars show Not Started / In Progress / Completed activities; fill shows % complete; the dashed red line marks the current as-of date.</p>
+  `;
+}
+
+function addActivity(ev) {
+  ev.preventDefault();
+  const f = new FormData(ev.target);
+  if (new Date(f.get('planned_end')) < new Date(f.get('planned_start'))) { showError('Planned end date cannot be before start date'); return false; }
+  const cost = parseFloat(f.get('cost_estimate'));
+  if (isNaN(cost) || cost < 0) { showError('Cost estimate must be a non-negative number'); return false; }
+  run(`INSERT INTO activities (project_id, wbs_id, name, assigned_to, planned_start, planned_end, cost_estimate, percent_complete, status)
+       VALUES (?,?,?,?,?,?,?,0,'Not Started')`,
+    [PROJECT_ID, f.get('wbs_id') || null, f.get('name'), f.get('assigned_to') || null, f.get('planned_start'), f.get('planned_end'), cost]);
+  const newId = one(`SELECT last_insert_rowid() AS id`).id;
+  if (f.get('depends_on')) {
+    run(`INSERT INTO dependencies (activity_id, depends_on_id) VALUES (?,?)`, [newId, f.get('depends_on')]);
+  }
+  ev.target.reset();
+  renderAll();
+  return false;
+}
+
+function updateActivityField(id, field, value) {
+  if (field === 'percent_complete') {
+    value = Math.max(0, Math.min(100, parseFloat(value) || 0));
+    if (value === 100) {
+      const a = one(`SELECT actual_start FROM activities WHERE id=?`, [id]);
+      run(`UPDATE activities SET percent_complete=?, status='Completed', actual_end=COALESCE(actual_end, ?), actual_start=COALESCE(actual_start, planned_start) WHERE id=?`, [value, getAsOf(), id]);
+      renderAll();
+      return;
+    }
+  }
+  run(`UPDATE activities SET ${field}=? WHERE id=?`, [value, id]);
+  renderAll();
+}
+
+/* ===========================================================
+   MODULE 4: COST MANAGEMENT & EARNED VALUE ANALYSIS
+=========================================================== */
+function computeEVM() {
+  const asOf = getAsOf();
+  const acts = query(`SELECT * FROM activities WHERE project_id=?`, [PROJECT_ID]);
+  let PV = 0, EV = 0, AC = 0, BAC = 0;
+  const rows = acts.map(a => {
+    BAC += a.cost_estimate;
+    const dur = Math.max(1, daysBetween(a.planned_start, a.planned_end));
+    const elapsed = Math.max(0, Math.min(dur, daysBetween(a.planned_start, asOf)));
+    const plannedFraction = elapsed / dur;
+    const pv = a.cost_estimate * plannedFraction;
+    const ev = a.cost_estimate * (a.percent_complete / 100);
+    const ac = a.actual_cost;
+    PV += pv; EV += ev; AC += ac;
+    return { ...a, pv, ev, ac };
+  });
+  const CPI = AC > 0 ? EV / AC : null;
+  const SPI = PV > 0 ? EV / PV : null;
+  const CV = EV - AC;
+  const SV = EV - PV;
+  const EAC = CPI && CPI > 0 ? BAC / CPI : null;
+  const VAC = EAC !== null ? BAC - EAC : null;
+  return { rows, PV, EV, AC, BAC, CPI, SPI, CV, SV, EAC, VAC, asOf };
+}
+
+function renderCost() {
+  const p = one(`SELECT * FROM project WHERE id=?`, [PROJECT_ID]);
+  const approvedCR = one(`SELECT COALESCE(SUM(cost_impact),0) c FROM change_requests WHERE project_id=? AND status='Approved'`, [PROJECT_ID]);
+  const currentBudget = p.approved_budget + approvedCR.c;
+  const evm = computeEVM();
+
+  const warnings = [];
+  if (evm.CPI !== null && evm.CPI < 0.9) warnings.push(`Cost Performance Index (CPI = ${evm.CPI.toFixed(2)}) is below 0.90 — the project is overrunning cost relative to work performed.`);
+  if (evm.SPI !== null && evm.SPI < 0.9) warnings.push(`Schedule Performance Index (SPI = ${evm.SPI.toFixed(2)}) is below 0.90 — the project is behind schedule relative to the plan.`);
+  if (evm.AC > currentBudget) warnings.push(`Actual Cost (${fmtMoney(evm.AC)}) has exceeded the current approved budget (${fmtMoney(currentBudget)}).`);
+  if (evm.EAC !== null && evm.EAC > currentBudget) warnings.push(`Estimate at Completion (${fmtMoney(evm.EAC)}) is projected to exceed the current approved budget (${fmtMoney(currentBudget)}).`);
+
+  document.getElementById('tab-cost').innerHTML = `
+    <h2>Cost Management &amp; Earned Value Analysis</h2>
+    <div class="card">
+      <h3>Budget Summary (as of ${evm.asOf})</h3>
+      <table class="kv">
+        <tr><td>Current Approved Budget</td><td>${fmtMoney(currentBudget)}</td></tr>
+        <tr><td>Budget at Completion (BAC, sum of activity estimates)</td><td>${fmtMoney(evm.BAC)}</td></tr>
+      </table>
+    </div>
+
+    <div class="card">
+      <h3>Earned Value Management Indicators</h3>
+      <div class="evm-grid">
+        <div class="evm-tile"><div class="evm-label">Planned Value (PV)</div><div class="evm-value">${fmtMoney(evm.PV)}</div></div>
+        <div class="evm-tile"><div class="evm-label">Earned Value (EV)</div><div class="evm-value">${fmtMoney(evm.EV)}</div></div>
+        <div class="evm-tile"><div class="evm-label">Actual Cost (AC)</div><div class="evm-value">${fmtMoney(evm.AC)}</div></div>
+        <div class="evm-tile"><div class="evm-label">Cost Variance (EV-AC)</div><div class="evm-value ${evm.CV<0?'neg':'pos'}">${fmtMoney(evm.CV)}</div></div>
+        <div class="evm-tile"><div class="evm-label">Schedule Variance (EV-PV)</div><div class="evm-value ${evm.SV<0?'neg':'pos'}">${fmtMoney(evm.SV)}</div></div>
+        <div class="evm-tile"><div class="evm-label">Cost Performance Index (CPI)</div><div class="evm-value ${evm.CPI!==null && evm.CPI<1?'neg':'pos'}">${evm.CPI!==null?evm.CPI.toFixed(2):'N/A'}</div></div>
+        <div class="evm-tile"><div class="evm-label">Schedule Performance Index (SPI)</div><div class="evm-value ${evm.SPI!==null && evm.SPI<1?'neg':'pos'}">${evm.SPI!==null?evm.SPI.toFixed(2):'N/A'}</div></div>
+        <div class="evm-tile"><div class="evm-label">Estimate at Completion (EAC)</div><div class="evm-value">${evm.EAC!==null?fmtMoney(evm.EAC):'N/A'}</div></div>
+      </div>
+      ${warnings.length ? `<div class="warning-box">${warnings.map(w => `<p class="warning">⚠ ${esc(w)}</p>`).join('')}</div>` : `<p class="ok">✔ Cost and schedule performance are within acceptable thresholds (CPI &amp; SPI ≥ 0.90).</p>`}
+    </div>
+
+    <div class="card">
+      <h3>Activity Cost Detail</h3>
+      <table class="data">
+        <thead><tr><th>Activity</th><th>Cost Estimate</th><th>% Complete</th><th>PV</th><th>EV</th><th>Actual Cost</th><th>Update Actual Cost</th></tr></thead>
+        <tbody>
+          ${evm.rows.map(r => `
+            <tr>
+              <td>${esc(r.name)}</td>
+              <td>${fmtMoney(r.cost_estimate)}</td>
+              <td>${r.percent_complete}%</td>
+              <td>${fmtMoney(r.pv)}</td>
+              <td>${fmtMoney(r.ev)}</td>
+              <td>${fmtMoney(r.ac)}</td>
+              <td><input type="number" min="0" value="${r.actual_cost}" style="width:110px" onchange="updateActivityField(${r.id}, 'actual_cost', this.value)"></td>
+            </tr>`).join('')}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
+/* ===========================================================
+   MODULE 5: QUALITY MANAGEMENT & RISK CONTROL
+=========================================================== */
+function renderQuality() {
+  const defects = query(`SELECT * FROM defects WHERE project_id=? ORDER BY id`, [PROJECT_ID]);
+  const checklist = query(`SELECT * FROM quality_checklist WHERE project_id=? ORDER BY id`, [PROJECT_ID]);
+  const risks = query(`SELECT * FROM risks WHERE project_id=? ORDER BY (likelihood*impact) DESC`, [PROJECT_ID]);
+  const acts = query(`SELECT id, name FROM activities WHERE project_id=?`, [PROJECT_ID]);
+  const team = query(`SELECT * FROM team_members`);
+  const wbsWP = query(`SELECT * FROM wbs WHERE project_id=? AND type='Work Package' ORDER BY code`, [PROJECT_ID]);
+
+  document.getElementById('tab-quality').innerHTML = `
+    <h2>Quality Management &amp; Risk Control</h2>
+
+    <div class="card">
+      <h3>Defect Tracking</h3>
+      <form onsubmit="return addDefect(event)" class="inline-form wrap">
+        <input name="description" placeholder="Defect description" style="flex:2" required>
+        <select name="severity">${['Low','Medium','High','Critical'].map(s=>`<option>${s}</option>`).join('')}</select>
+        <select name="activity_id"><option value="">(no linked activity)</option>${acts.map(a=>`<option value="${a.id}">${esc(a.name)}</option>`).join('')}</select>
+        <select name="assigned_to"><option value="">(unassigned)</option>${team.map(t=>`<option value="${t.id}">${esc(t.name)}</option>`).join('')}</select>
+        <button class="btn" type="submit">Log Defect</button>
+      </form>
+      <table class="data">
+        <thead><tr><th>#</th><th>Description</th><th>Severity</th><th>Activity</th><th>Assigned</th><th>Status</th><th>Reported</th><th></th></tr></thead>
+        <tbody>
+          ${defects.map(d => {
+            const a = acts.find(x => x.id === d.activity_id);
+            const t = team.find(x => x.id === d.assigned_to);
+            return `<tr>
+              <td>DEF-${d.id}</td><td>${esc(d.description)}</td>
+              <td><span class="badge ${badgeClass(d.severity)}">${d.severity}</span></td>
+              <td>${a ? esc(a.name) : '-'}</td><td>${t ? esc(t.name) : '-'}</td>
+              <td><select onchange="updateDefectStatus(${d.id}, this.value)">${['Open','In Progress','Resolved','Closed'].map(s=>`<option ${s===d.status?'selected':''}>${s}</option>`).join('')}</select></td>
+              <td>${d.date_reported}</td>
+              <td><button class="btn-sm danger" onclick="deleteRow('defects', ${d.id})">Delete</button></td>
+            </tr>`;
+          }).join('')}
+        </tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h3>Quality Checklist (Deliverable Inspection &amp; Testing)</h3>
+      <form onsubmit="return addChecklist(event)" class="inline-form wrap">
+        <select name="wbs_id" required>${wbsWP.map(w=>`<option value="${w.id}">${esc(w.code)} ${esc(w.name)}</option>`).join('')}</select>
+        <input name="criterion" placeholder="Inspection / test criterion" style="flex:2" required>
+        <select name="result">${['Pending','Pass','Fail'].map(r=>`<option>${r}</option>`).join('')}</select>
+        <input name="tested_by" placeholder="Tested by">
+        <button class="btn" type="submit">Add Checklist Item</button>
+      </form>
+      <table class="data">
+        <thead><tr><th>Deliverable</th><th>Criterion</th><th>Result</th><th>Tested By</th><th>Date</th><th></th></tr></thead>
+        <tbody>
+          ${checklist.map(c => {
+            const w = wbsWP.find(x => x.id === c.wbs_id);
+            return `<tr>
+              <td>${w ? esc(w.code)+' '+esc(w.name) : ''}</td><td>${esc(c.criterion)}</td>
+              <td><span class="badge ${badgeClass(c.result)}">${c.result}</span></td>
+              <td>${esc(c.tested_by||'')}</td><td>${c.date_tested||'-'}</td>
+              <td><button class="btn-sm danger" onclick="deleteRow('quality_checklist', ${c.id})">Delete</button></td>
+            </tr>`;
+          }).join('')}
+        </tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h3>Risk / Issue Prioritization Matrix</h3>
+      <form onsubmit="return addRisk(event)" class="inline-form wrap">
+        <input name="description" placeholder="Risk / issue description" style="flex:2" required>
+        <label>Likelihood <select name="likelihood">${[1,2,3,4,5].map(n=>`<option>${n}</option>`).join('')}</select></label>
+        <label>Impact <select name="impact">${[1,2,3,4,5].map(n=>`<option>${n}</option>`).join('')}</select></label>
+        <input name="response_strategy" placeholder="Response strategy (Avoid/Mitigate/Transfer/Accept)">
+        <input name="pdpc_preventive" placeholder="Preventive action" style="flex:1.5">
+        <input name="pdpc_corrective" placeholder="Corrective action" style="flex:1.5">
+        <button class="btn" type="submit">Add Risk</button>
+      </form>
+
+      ${renderRiskMatrix(risks)}
+
+      <table class="data">
+        <thead><tr><th>Risk</th><th>L×I</th><th>Score</th><th>Strategy</th><th>Status</th><th></th></tr></thead>
+        <tbody>
+          ${risks.map(r => `
+            <tr>
+              <td>${esc(r.description)}</td>
+              <td>${r.likelihood} × ${r.impact}</td>
+              <td><span class="badge ${riskBadge(r.likelihood*r.impact)}">${r.likelihood*r.impact}</span></td>
+              <td>${esc(r.response_strategy||'')}</td>
+              <td><select onchange="updateRiskStatus(${r.id}, this.value)">${['Open','Mitigated','Closed'].map(s=>`<option ${s===r.status?'selected':''}>${s}</option>`).join('')}</select></td>
+              <td><button class="btn-sm danger" onclick="deleteRow('risks', ${r.id})">Delete</button></td>
+            </tr>`).join('')}
+        </tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h3>Process Decision Program Chart (PDPC) — Risk Response View</h3>
+      <div class="pdpc-grid">
+        ${risks.map(r => `
+          <div class="pdpc-card">
+            <div class="pdpc-risk">⚠ ${esc(r.description)}</div>
+            <div class="pdpc-arrow">↓ if risk materializes</div>
+            <div class="pdpc-row">
+              <div class="pdpc-box preventive"><b>Preventive Action</b><br>${esc(r.pdpc_preventive || '—')}</div>
+              <div class="pdpc-box corrective"><b>Corrective Action</b><br>${esc(r.pdpc_corrective || '—')}</div>
+            </div>
+          </div>
+        `).join('') || '<p class="hint">No risks logged yet.</p>'}
+      </div>
+    </div>
+  `;
+}
+
+function riskBadge(score) {
+  if (score >= 15) return 'red';
+  if (score >= 8) return 'orange';
+  if (score >= 4) return 'yellow';
+  return 'green';
+}
+
+function renderRiskMatrix(risks) {
+  let cells = '';
+  for (let impact = 5; impact >= 1; impact--) {
+    for (let like = 1; like <= 5; like++) {
+      const inCell = risks.filter(r => r.likelihood === like && r.impact === impact);
+      const score = like * impact;
+      cells += `<div class="matrix-cell ${riskBadge(score)}" title="Likelihood ${like} × Impact ${impact} = ${score}">
+        ${inCell.map(r => `<div class="matrix-item" title="${esc(r.description)}">${esc(r.description).slice(0,14)}${r.description.length>14?'…':''}</div>`).join('')}
+      </div>`;
+    }
+  }
+  return `
+    <div class="matrix-wrap">
+      <div class="matrix-axis-y">Impact →</div>
+      <div class="matrix-grid">${cells}</div>
+    </div>
+    <div class="matrix-axis-x">Likelihood →</div>
+    <p class="hint">Cell color = risk score (Likelihood × Impact): green (low) → yellow → orange → red (critical, score ≥ 15).</p>
+  `;
+}
+
+function addDefect(ev) {
+  ev.preventDefault();
+  const f = new FormData(ev.target);
+  if (!f.get('description').trim()) { showError('Defect description is required'); return false; }
+  run(`INSERT INTO defects (project_id, activity_id, description, severity, assigned_to, status, date_reported) VALUES (?,?,?,?,?,?,?)`,
+    [PROJECT_ID, f.get('activity_id') || null, f.get('description'), f.get('severity'), f.get('assigned_to') || null, 'Open', getAsOf()]);
+  ev.target.reset();
+  renderAll();
+  return false;
+}
+function updateDefectStatus(id, status) { run(`UPDATE defects SET status=? WHERE id=?`, [status, id]); renderAll(); }
+
+function addChecklist(ev) {
+  ev.preventDefault();
+  const f = new FormData(ev.target);
+  run(`INSERT INTO quality_checklist (project_id, wbs_id, criterion, result, tested_by, date_tested) VALUES (?,?,?,?,?,?)`,
+    [PROJECT_ID, f.get('wbs_id'), f.get('criterion'), f.get('result'), f.get('tested_by'), f.get('result') !== 'Pending' ? getAsOf() : null]);
+  ev.target.reset();
+  renderAll();
+  return false;
+}
+
+function addRisk(ev) {
+  ev.preventDefault();
+  const f = new FormData(ev.target);
+  if (!f.get('description').trim()) { showError('Risk description is required'); return false; }
+  run(`INSERT INTO risks (project_id, description, likelihood, impact, response_strategy, pdpc_preventive, pdpc_corrective, status) VALUES (?,?,?,?,?,?,?,?)`,
+    [PROJECT_ID, f.get('description'), parseInt(f.get('likelihood')), parseInt(f.get('impact')), f.get('response_strategy'), f.get('pdpc_preventive'), f.get('pdpc_corrective'), 'Open']);
+  ev.target.reset();
+  renderAll();
+  return false;
+}
+function updateRiskStatus(id, status) { run(`UPDATE risks SET status=? WHERE id=?`, [status, id]); renderAll(); }
+
+/* ===========================================================
+   MODULE 6: SYSTEM INTEGRATION, VALIDATION & DASHBOARD
+=========================================================== */
+function renderDashboard() {
+  const p = one(`SELECT * FROM project WHERE id=?`, [PROJECT_ID]);
+  if (!p) return;
+  const evm = computeEVM();
+  const { analysis, acts, projectEndSlip } = computeScheduleAnalysis();
+  const delayedActs = acts.filter(a => analysis[a.id].delayed);
+  const pendingCR = one(`SELECT COUNT(*) n FROM change_requests WHERE project_id=? AND status='Pending'`, [PROJECT_ID]).n;
+  const approvedCRsum = one(`SELECT COALESCE(SUM(cost_impact),0) c FROM change_requests WHERE project_id=? AND status='Approved'`, [PROJECT_ID]).c;
+  const currentBudget = p.approved_budget + approvedCRsum;
+  const criticalDefects = query(`SELECT * FROM defects WHERE project_id=? AND severity IN ('High','Critical') AND status NOT IN ('Resolved','Closed')`, [PROJECT_ID]);
+  const overallProgress = evm.BAC > 0 ? (evm.EV / evm.BAC) * 100 : 0;
+  const openRisks = query(`SELECT * FROM risks WHERE project_id=? AND status='Open' ORDER BY (likelihood*impact) DESC LIMIT 3`, [PROJECT_ID]);
+
+  document.getElementById('tab-dashboard').innerHTML = `
+    <h2>Project Dashboard</h2>
+    <p class="hint">${esc(p.name)} — Status: <span class="badge ${badgeClass(p.status)}">${p.status}</span> — as of <b>${getAsOf()}</b></p>
+
+    <div class="dash-grid">
+      <div class="dash-tile">
+        <div class="dash-num">${overallProgress.toFixed(0)}%</div>
+        <div class="dash-label">Overall Progress (EV / BAC)</div>
+        <div class="progressbar"><div style="width:${Math.min(100,overallProgress)}%"></div></div>
+      </div>
+      <div class="dash-tile ${pendingCR>0?'warn':''}">
+        <div class="dash-num">${pendingCR}</div>
+        <div class="dash-label">Pending Change Requests</div>
+      </div>
+      <div class="dash-tile ${delayedActs.length>0?'warn':''}">
+        <div class="dash-num">${delayedActs.length}</div>
+        <div class="dash-label">Delayed Activities</div>
+      </div>
+      <div class="dash-tile ${evm.AC>currentBudget?'bad':''}">
+        <div class="dash-num">${((evm.AC/currentBudget)*100).toFixed(0)}%</div>
+        <div class="dash-label">Budget Utilized (${fmtMoney(evm.AC)} / ${fmtMoney(currentBudget)})</div>
+      </div>
+      <div class="dash-tile ${criticalDefects.length>0?'bad':''}">
+        <div class="dash-num">${criticalDefects.length}</div>
+        <div class="dash-label">Unresolved Critical/High Defects</div>
+      </div>
+      <div class="dash-tile ${evm.CPI!==null&&evm.CPI<1?'warn':''}">
+        <div class="dash-num">${evm.CPI!==null?evm.CPI.toFixed(2):'N/A'}</div>
+        <div class="dash-label">CPI</div>
+      </div>
+      <div class="dash-tile ${evm.SPI!==null&&evm.SPI<1?'warn':''}">
+        <div class="dash-num">${evm.SPI!==null?evm.SPI.toFixed(2):'N/A'}</div>
+        <div class="dash-label">SPI</div>
+      </div>
+      <div class="dash-tile ${projectEndSlip>0?'warn':''}">
+        <div class="dash-num">${projectEndSlip}d</div>
+        <div class="dash-label">Projected Deadline Slip</div>
+      </div>
+    </div>
+
+    <div class="grid2">
+      <div class="card">
+        <h3>Delayed Activities</h3>
+        ${delayedActs.length ? `<ul>${delayedActs.map(a => `<li>${esc(a.name)} — planned end ${a.planned_end}${analysis[a.id].delayDays ? `, projected slip ${analysis[a.id].delayDays}d` : ''}</li>`).join('')}</ul>` : '<p class="ok">None — schedule is healthy.</p>'}
+      </div>
+      <div class="card">
+        <h3>Unresolved Critical/High Defects</h3>
+        ${criticalDefects.length ? `<ul>${criticalDefects.map(d => `<li><span class="badge ${badgeClass(d.severity)}">${d.severity}</span> ${esc(d.description)} — ${d.status}</li>`).join('')}</ul>` : '<p class="ok">None.</p>'}
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>Top Risks</h3>
+      ${openRisks.length ? `<ul>${openRisks.map(r => `<li><span class="badge ${riskBadge(r.likelihood*r.impact)}">${r.likelihood*r.impact}</span> ${esc(r.description)}</li>`).join('')}</ul>` : '<p class="ok">No open risks.</p>'}
+    </div>
+  `;
+}
